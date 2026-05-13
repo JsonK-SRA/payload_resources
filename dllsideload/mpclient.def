@@ -216,3 +216,6 @@ WDStatus="c:\Program Files\Windows Defender\MpClient.WDStatus" @214
 MpServiceLogMessage="c:\Program Files\Windows Defender\MpClient.MpServiceLogMessage" @215
 MpGetNpSupportFile="c:\Program Files\Windows Defender\MpClient.MpGetNpSupportFile" @216
 MpEffectiveConfigurationReport="c:\Program Files\Windows Defender\MpClient.MpEffectiveConfigurationReport" @217
+MpGetTrustAnchors="c:\Program Files\Windows Defender\MpClient.MpGetTrustAnchors" @218
+MpScanCancel="c:\Program Files\Windows Defender\MpClient.MpScanCancel" @219
+MpGetHIPSCustomRuleInfo="c:\Program Files\Windows Defender\MpClient.MpGetHIPSCustomRuleInfo" @220
